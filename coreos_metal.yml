@@ -1,0 +1,193 @@
+heat_template_version: 2013-05-23
+
+description: Deploy a CoreOS cluster that tracks the Stable Channel
+
+parameters:
+  count:
+    description: Number of CoreOS machines to deploy
+    type: number
+    default: 3
+    constraints:
+    - range:
+        min: 1
+        max: 12
+      description: Must be between 3 and 12 servers.
+  flavor:
+    type: string
+    default: OnMetal Compute v1
+    constraints:
+    - allowed_values:
+      - OnMetal Compute v1
+      - OnMetal I/O v1
+      - OnMetal Memory v1
+      description: |
+        Must be a valid Rackspace Cloud Server flavor for the region you have
+        selected to deploy into.
+  image:
+    type: string
+    default: OnMetal - CoreOS (Alpha)
+    constraints:
+    - allowed_values:
+      - OnMetal - CoreOS (Alpha) # alpha
+      - OnMetal - CoreOS (Beta) # beta
+      - OnMetal - CoreOS (Stable) # stable
+  name:
+    type: string
+    description: Name of each CoreOS machine booted
+    default: CoreOS_OnMetal
+  etcd_discovery:
+    type: string
+    description: URL of etcd discovery
+    default: master
+
+resources:
+
+  ssh_key:
+    type: "OS::Nova::KeyPair"
+    properties:
+      name: { get_param: name }
+      save_private_key: true
+
+  coreos_nodes:
+    type: "OS::Heat::ResourceGroup"
+    properties:
+      count: { get_param: count }
+      resource_def:
+        type: OS::Nova::Server
+        properties:
+          key_name: { get_resource: ssh_key }
+          image: { get_param: image }
+          flavor: { get_param: flavor }
+          name: { get_param: name }
+          user_data_format: RAW
+          config_drive: "true"
+          user_data:
+            str_replace:
+              template: |
+                #cloud-config
+                ---
+                write_files:
+                  - path: /etc/motd
+                    content: "CoreOS on RAX\n"
+                  - path: /var/run/json
+                    permissions: 0755
+                    content: |
+                  - path: /etc/profile.d/nse-function.sh
+                    permissions: 0755
+                    content: |
+                      function nse() {
+                        sudo nsenter --pid --uts --mount --ipc --net --target $(docker inspect --format="{{ .State.Pid }}" $1)
+                      }
+                  - path:  /etc/iptables.rules
+                    permissions: 0600
+                    content: |
+                      *filter
+                      :INPUT DROP [0:0]
+                      :FORWARD DROP [0:0]
+                      :OUTPUT ACCEPT [0:0]
+                      -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+                      -A INPUT -p tcp --dport 22 -j ACCEPT
+                      -A INPUT -i lo -j ACCEPT
+                      -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
+                      -A INPUT -p icmp --icmp-type destination-unreachable -j ACCEPT
+                      -A INPUT -p icmp --icmp-type time-exceeded -j ACCEPT
+                      #-A INPUT -p tcp -i bond0.101 --dport 4001 -j DROP
+                      #-A INPUT -p tcp -i bond0.101 --dport 7001 -j DROP
+                      #-A INPUT -i bond0.101 -j DROP
+                      COMMIT
+                coreos:
+                  etcd:
+                    # generate a new token for each unique cluster from https://discovery.etcd.io/new
+                    # uncomment the following line and replace it with your discovery URL
+                    addr: $private_ipv4:4001
+                    peer-addr: $private_ipv4:7001
+                    discovery: %etcd_discovery%
+                  fleet:
+                  units:
+                  - name: etcd.service
+                    command: start
+                  - name: fleet.service
+                    command: start
+                  - name: stop-update-engine.service
+                    command: start
+                    content: |
+                      [Unit]
+                      Description=stop update-engine
+
+                      [Service]
+                      Type=oneshot
+                      ExecStart=/usr/bin/systemctl stop update-engine.service
+                      ExecStartPost=/usr/bin/systemctl mask update-engine.service
+                  - name: firewall.service
+                    command: stop
+                    content: |
+                      [Unit]
+                      Description=firewall
+                      DefaultDependencies=no
+                      After=systemd-sysctl.service
+                      Before=sysinit.target
+
+                      [Service]
+                      Type=oneshot
+                      RemainAfterExit=yes
+                      ExecStart=/sbin/iptables-restore /etc/iptables.rules
+                      ExecReload=/usr/sbin/iptables-restore /etc/iptables.rules
+                      ExecStop=/usr/sbin/iptables --flush
+                      RemainAfterExit=yes
+
+                      [Install]
+                      WantedBy=sysinit.target
+                  - name: create-coreos-env.service
+                    command: start
+                    content: |
+                      [Unit]
+                      Description=creates coreos environment
+
+                      [Service]
+                      Before=fix-etcd-env.service
+                      Type=oneshot
+                      ExecStartPre=/bin/sh -c "echo COREOS_PUBLIC_IPV4=`ifconfig bond0.101 | grep 'inet ' | awk '{print $2}'` >> /etc/environment"
+                      ExecStart=/bin/sh -c "echo COREOS_PRIVATE_IPV4=`ifconfig bond0.401 | grep 'inet ' | awk '{print $2}'` >> /etc/environment"
+                  - name: fix-etcd-env.service
+                    command: start
+                    content: |
+                      [Unit]
+                      Description=fixes etcd service
+
+                      [Service]
+                      Before=etcd.service
+                      Type=oneshot
+                      ExecStart=/bin/sh -c "sed -i \"s/=:/=`ifconfig bond0.401 | grep 'inet ' | awk '{print $2}'`:/\" /run/systemd/system/etcd.service.d/20-cloudinit.conf"
+                      ExecStartPost=/usr/bin/systemctl daemon-reload
+              params:
+                "%ssh_private_key%": { get_attr: [ssh_key, private_key] }
+                "%etcd_discovery%": { get_param: etcd_discovery }
+
+  coreos_loadbalancer:
+    type: Rackspace::Cloud::LoadBalancer
+    properties:
+      name: { get_param: name }
+      nodes:
+      - addresses: { get_attr: [coreos_nodes, accessIPv4]} # This is where the
+                                                       # wiring magic happens
+        port: 22
+        condition: ENABLED
+      protocol: TCP
+      port: 22
+      virtualIps:
+      - type: PUBLIC
+        ipVersion: IPV4
+
+outputs:
+  loadbalancer:
+    description: The public IP address of the load balancer
+    value: { get_attr: [coreos_loadbalancer, PublicIp]}
+  public_ips:
+    description: The public IP addresses of coreos nodes
+    value: { get_attr: [coreos_nodes, accessIPv4]}
+  networks:
+    description: The networks of the coreos nodes.
+    value: { get_attr: [coreos_nodes, networks]}
+  private_key:
+    description: SSH Private Key
+    value: { get_attr: [ssh_key, private_key] }

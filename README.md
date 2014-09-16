@@ -5,8 +5,7 @@ Basic CoreOS Cluster - on VMs
 --------------------------------------------
 
 ```console
-$ heat stack-create CoreOS --template-file=coreos_metal.yml \
- -P flavor='2 GB Performance' -P count=3 \
+$ heat stack-create CoreOS --template-file=coreos.yml \
  -P name=CoreOS -P etcd_discovery=$(curl -s https://discovery.etcd.io/new)
 ```
 
@@ -22,6 +21,6 @@ Log into CoreOS
 ------------------------
 ```console
 $ eval `ssh-agent`
-$ echo `heat output-show CoreOS private_key | sed 's/"//g'` | ssh-add -
+$ echo $(heat output-show CoreOS private_key | sed 's/"//g') | ssh-add -
 $ export LB=$(heat output-show CoreOS loadbalancer | sed 's/"//g') && echo $LB
 ```
